@@ -45,8 +45,8 @@ target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
 audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
 
 # Fetch the Discord bot token from environment variables
-#TOKEN = os.getenv('CHIVBOT_KEY')
-TOKEN = 'MTIyNzA3NzY5NzUyNDczMjAzNQ.GyLRw4.tLnKr6SR8O357RHfv-AU0uEl2lqhwYZV8eLIjo'
+TOKEN = os.getenv('CHIVBOT_KEY')
+
 # Check if the token is retrieved successfully
 if TOKEN:
     print("Discord bot token:", TOKEN)
