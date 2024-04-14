@@ -20,38 +20,35 @@ from coin import CoinCog
 from admin import AdminCommands
 from privateservers import PrivateServers
 
+# Define the custom command check to determine if the channel is named as specified
+def is_channel_named(channel_names):
+    async def predicate(ctx):
+        return ctx.channel.name in channel_names
+    return commands.check(predicate)
 
-# Database connection credentials
+
+# Define the database connection credentials
 DATABASE = "chivstats"
 USER = "postgresuser"
 PASSWORD = "$tlMlb3728964"
 HOST = "localhost"
 
-# URL for the duels leaderboard and list of Discord guild IDs where the bot is active.
-# Not including guild ids causes a delay in command update replication.
-#DUELS_LEADERBOARD_URL = "https://chivstats.xyz/leaderboards/ranked_combat/" 
-GUILD_IDS = [
-             #878005964685582406, #Tournament grounds @funk
-             #1163168644524687394, #Goblins @short
-             #1108303022834069554,#Divided Loyalty @chillzone
-             #1152345485747691560, #WILD WEST @SMD408
-             #1213625786163011714, #Duelyard server @short
-             #987187886094962828, #The Crucible, @kait
-             1227017798916505780, #the Monad, @lambss_
-             1228057171972063323, #blehtest, @lambss_
-             ]
+# Define the database URL
+#DATABASE_URL = f"postgresql://{USER}:{PASSWORD}@{HOST}/{DATABASE}"
 
-target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
+# Define the bot token
+TOKEN = 'MTIyNzA3NzY5NzUyNDczMjAzNQ.GEQVKU.IgUfFmWMJ1XFVSwr-h50OigF53tg3EQmN4SWDw'
+
+# Define the guild and audit channel IDs
+target_guild_id = 1227017798916505780  # ID of the 'the Monad' Guild
 audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
+ranked_leaderboards_id = 1228902128039497862 # ID of ranked-leaderboards channel
 
-# Fetch the Discord bot token from environment variables
-TOKEN = os.getenv('CHIVBOT_KEY')
-
-# Check if the token is retrieved successfully
-if TOKEN:
-    print("Discord bot token:", TOKEN)
-else:
-    print("Error: Discord bot token not found in environment variables.")
+# Define the guild IDs for the slash command
+GUILD_IDS = [
+    1227017798916505780,  # the Monad
+    1228057171972063323,  # blehtest
+]
 
 # Initialize the bot with command prefix and defined intents
 intents = discord.Intents.default()
@@ -61,7 +58,6 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-    
 
 # Indicate bot startup in console
 print("Bot is starting up...")
@@ -70,11 +66,17 @@ print("Bot is starting up...")
 duel_queue = []
 duo_queue = []
 
-#leaderboard_classes = ["GlobalXp", "experienceknight"] # List of leaderboards (todo)
+leaderboard_classes = ["GlobalXp", "experienceknight"] # List of leaderboards (todo)
+
 
 # Async function to establish a database connection
 async def create_db_connection():
-    return await asyncpg.connect(database=DATABASE, user=USER, password=PASSWORD, host=HOST)
+    try:
+        conn = await asyncpg.connect(database=DATABASE, user=USER, password=PASSWORD, host=HOST)
+        return conn
+    except Exception as e:
+        print(f"Failed to establish database connection: {e}")
+        return None
 
 # Async function to close a database connection
 async def close_db_connection(conn):
@@ -103,30 +105,43 @@ def is_channel_named(allowed_channel_names):
             )
         return True
     return commands.check(predicate)
-    r
 
-async def fetch_username(user_id, conn):
-    common_name = await conn.fetchval('SELECT common_name FROM ranked_players WHERE discordid = $1', user_id)
-    return common_name if common_name else "Unknown"
+@bot.event
+async def on_application_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, CheckFailure):
+        embed = discord.Embed(
+            title="Command Restricted",
+            description=(
+                "This command can only be used in a `#chivstats-ranked` channel.\n"
+                "Navigate to the `#chivstats-ranked` channel in this server to use the bot.\n"
+                #"For more info, visit [chivstats.xyz](https://chivstats.xyz)."
+            ),
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        print(f"An unexpected error occurred: {error}")
 
 
-bot.event
+# Bot startup
+@bot.event
 async def on_ready():
     print("Bot has started up.")
+
+    # Attempt to establish a database connection
+    conn = await create_db_connection()
+    if conn is None:
+        print("Failed to establish database connection. Bot will not process pending confirmations.")
+        return  # Terminate the bot initialization process
+
     try:
-        # Establish a database connection
-        conn = await asyncpg.connect(database=DATABASE, user=USER, password=PASSWORD, host=HOST)
+        # Fetch guild and audit channel
+        audit_guild = bot.get_guild(target_guild_id)
+        audit_channel = audit_guild.get_channel(audit_channel_id)
 
-        # Define the IDs of the target guild and audit channel
-        target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
-        audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
-
-        # Retrieve the target guild and audit channel
-        target_guild = bot.get_guild(target_guild_id)
-        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
-
-        # Get the count and information of pending duels
+        # Fetch pending duel confirmations
         pending_duels_info = await conn.fetch("SELECT * FROM duel_confirmations WHERE status = 'pending'")
+        print(f"Found {len(pending_duels_info)} pending confirmations.")
 
         # Create the summary message
         summary_message = "**Summary of Pending Duels**\n"
@@ -163,6 +178,13 @@ async def on_ready():
             loser_id = duel_info['loser_id']
             message_id = duel_info['message_id']  # Include the message_id
             creation_time = duel_info['creation_time']  # Include creation_time
+            status = duel_info['status']  # Include status
+
+            # Fetch submitter_name, opponent_name, winner_name, and loser_name from the database
+            submitter_name = await conn.fetchval("SELECT discord_username FROM ranked_players WHERE discordid = $1", submitter_id)
+            opponent_name = await conn.fetchval("SELECT discord_username FROM ranked_players WHERE discordid = $1", opponent_id)
+            winner_name = await conn.fetchval("SELECT discord_username FROM ranked_players WHERE discordid = $1", winner_id)
+            loser_name = await conn.fetchval("SELECT discord_username FROM ranked_players WHERE discordid = $1", loser_id)
 
             # Construct and send the embed for pending duel confirmation
             embed = Embed(title="Pending Duel Confirmation", color=0xFFFF00)  # Yellow color
@@ -180,13 +202,14 @@ async def on_ready():
         expired_duels_count = 0
         for duel_info in pending_duels_info:
             creation_time = duel_info['creation_time']  # Include creation_time
+            status = duel_info['status']  # Include status
 
-            # Check if creation_time is over 2 hours old
-            if (datetime.now() - creation_time).total_seconds() > 7200:  # 2 hours in seconds
+            # Check if creation_time is over 2 hours old and status is 'pending'
+            if (datetime.now() - creation_time).total_seconds() > 7200 and status == 'pending':  # 2 hours in seconds
                 # Extract message_id
                 message_id = duel_info['message_id']
 
-                # If creation_time is over 2 hours old, update the status of the duel to 'expired'
+                # If creation_time is over 2 hours old and status is 'pending', update the status of the duel to 'expired'
                 await conn.execute("UPDATE duel_confirmations SET status = 'expired' WHERE message_id = $1", message_id)
 
                 # Send an embed message for the expired duel to the audit channel
@@ -198,61 +221,58 @@ async def on_ready():
                 expired_duels_count += 1
 
         # Send summary of expired duels
-        await audit_channel.send(f"Summary: {expired_duels_count} duels expired.")
+        if audit_channel:
+            await audit_channel.send(f"Summary: {expired_duels_count} duels expired.")
 
     except Exception as e:
         # Handle exceptions
-        error_msg = f"Error loading and processing pending confirmations: {e}"
+        error_msg = f"An unexpected error occurred: {e}"
         print(error_msg)
         if audit_channel:
             await audit_channel.send(f"```{error_msg}```")
     finally:
         # Close the database connection
-        await conn.close()
+        await close_db_connection(conn)
 
+# Function to process pending confirmations
+async def process_pending_confirmations(audit_channel):
+    if bot.db_conn:
+        try:
+            # Get the count and information of pending duels
+            pending_duels_info = await bot.db_conn.fetch("SELECT * FROM duel_confirmations WHERE status = 'pending'")
+            print(f"Found {len(pending_duels_info)} pending confirmations.")
 
-        
-# Global error handler for interactions
+            # Process pending duels and send summaries
+            # Your existing code to process pending duels and send summaries goes here...
+
+        except Exception as e:
+            # Handle exceptions
+            error_msg = f"Error processing pending confirmations: {e}"
+            print(error_msg)
+            if audit_channel:
+                await audit_channel.send(f"```{error_msg}```")
+
+        finally:
+            # Close the database connection
+            await close_db_connection(bot.db_conn)
+    else:
+        print("Failed to establish database connection. Cannot process pending confirmations.")
+
+# Bot disconnect event
 @bot.event
-async def on_interaction_error(interaction, error):
-    print(f"Interaction failed: {error}")
-    await interaction.response.send_message("There was an error with this interaction. Please contact an administrator.", ephemeral=True)
+async def on_disconnect():
+    if hasattr(bot, 'db_conn') and bot.db_conn is not None:
+        await close_db_connection(bot.db_conn)
+        
 
-# Ensure the bot has the necessary permissions to edit messages and manage messages in the channels it operates in.
-
-async def send_audit_message(interaction):
-    target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
-    audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
-    target_guild = bot.get_guild(target_guild_id)
-    audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
-
-    if audit_channel:
-        user_id = interaction.user.id
-        user_display_name = interaction.user.display_name
-
-        # Reconstruct the command from the interaction
-        command_name = interaction.command.name
-        entered_command = f"/{command_name}"
-
-        # Check if the interaction has options and append them to the command
-        if interaction.options:
-            for option in interaction.options:
-                # Append option name and value to the command string
-                entered_command += f" {option.name}={option.value}"
-
-        # Create and send the audit message
-        audit_message = f"Command executed: {entered_command} by {user_display_name} (ID: {user_id})"
-        await audit_channel.send(audit_message)
-
+# Slash command for listing Discord servers
 @bot.slash_command(guild_ids=GUILD_IDS, description="Lists the discords the chivbot is in, highlighting those with a chivstats-ranked channel.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def chivstats_network(interaction: discord.Interaction):
     await interaction.response.defer()
     # Predefined order for specific guilds
     priority_guilds = {
-        'the Monad': None,
-        'Tournament Grounds': None,
-        'Chivalry 2 Unchained': None
+        'the Monad': None
     }
     other_guilds = []
 
@@ -290,11 +310,9 @@ async def chivstats_network(interaction: discord.Interaction):
     )
     
     # Set the footer text
-    embed.set_footer(text="Add your clan discord to the Ranked Combat Network! Click the chivbot user profile for details or contact the Monad.")
+    embed.set_footer(text="Add your clan discord to the Ranked Combat Network! Click the chivbot user profile for details or contact gimmic.")
     
     await interaction.followup.send(embed=embed)  # Sends the message to the channel where the command was used
-
-
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="RANKED COMBAT: Provides help information about chivbot commands.")
@@ -551,11 +569,14 @@ def calculate_head_to_head_stats(head_to_head_stats, id_player1, id_player2, tot
 
     return avg_winner, h2h_wins_p1, h2h_losses_p1, total_h2h_matches, win_rate, h2h_percent_p1, h2h_percent_p2
 
+# Commands
 @bot.slash_command(guild_ids=GUILD_IDS, description="Display the top 10 leaderboard for duels or duos.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def leaderboard(interaction: discord.Interaction, category: str):
-    if category.lower() not in ['duel', 'duels', 'duo', 'duos']: # original string ['duel', 'duels', 'duo', 'duos']:
-        await interaction.response.send_message("Invalid category. Please enter 'duel(s)' for duel leaderboard or 'duo(s)' for duo leaderboard.", ephemeral=True)
+    """Display the leaderboard based on the provided category."""
+    valid_categories = ['duel', 'duels', 'duo', 'duos']
+    if category.lower() not in valid_categories:
+        await interaction.response.send_message(f"Invalid category. Please enter {' or '.join(valid_categories)} for the leaderboard.", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -565,6 +586,7 @@ async def leaderboard(interaction: discord.Interaction, category: str):
         embed = discord.Embed(title=f"{category.title()} Leaderboard", color=discord.Color.blue())
 
         if category.lower() in ['duel', 'duels']:
+            # Fetch and display duel leaderboard
             players = await conn.fetch("""
                 SELECT discordid, discord_username, elo_duelsx, playfabid FROM ranked_players
                 WHERE retired = FALSE
@@ -573,61 +595,28 @@ async def leaderboard(interaction: discord.Interaction, category: str):
             """)
 
             tier_assignments = await calculate_tiers(conn)
-            embed = discord.Embed(title=f"{category.title()} Leaderboard", color=discord.Color.blue())
-
-            leaderboard_lines = []
-            for index, player in enumerate(players, 1):
-                discord_id = player['discordid']
-                playfabid = player['playfabid']
-                elo_rating = round(player['elo_duelsx'])  # Round the ELO rating
-                tier_emoji = tier_assignments.get(playfabid, '❓')  # Get tier emoji
-                discord_name = player['discord_username']  # Fetch the display name
-
-                leaderboard_line = f"{index}. {tier_emoji} {discord_name} - {elo_rating}"
-                leaderboard_lines.append(leaderboard_line)
-
-            leaderboard_text = "\n".join(leaderboard_lines)
-            embed.description = leaderboard_text
-
-            await interaction.followup.send(embed=embed)
+            leaderboard_lines = [f"{index}. {tier_assignments.get(player['playfabid'], '❓')} {player['discord_username']} - {round(player['elo_duelsx'])}" for index, player in enumerate(players, 1)]
+            embed.description = "\n".join(leaderboard_lines)
 
         elif category.lower() in ['duo', 'duos']:
-              teams = await conn.fetch("""
-                  SELECT dt.team_name, dt.elo_rating, rp1.id as player1_id, rp2.id as player2_id
-                  FROM duo_teams dt
-                  JOIN ranked_players rp1 ON dt.player1_id = rp1.playfabid
-                  JOIN ranked_players rp2 ON dt.player2_id = rp2.playfabid
-                  WHERE dt.retired = FALSE
-                  ORDER BY dt.elo_rating DESC
-                  LIMIT 10
-              """)
+            # Fetch and display duo leaderboard
+            teams = await conn.fetch("""
+                SELECT dt.team_name, dt.elo_rating, rp1.id as player1_id, rp2.id as player2_id
+                FROM duo_teams dt
+                JOIN ranked_players rp1 ON dt.player1_id = rp1.playfabid
+                JOIN ranked_players rp2 ON dt.player2_id = rp2.playfabid
+                WHERE dt.retired = FALSE
+                ORDER BY dt.elo_rating DESC
+                LIMIT 10
+            """)
 
-              rank_tier = [f"{index}." for index, _ in enumerate(teams, 1)]
-              team_names = [team['team_name'] for team in teams]
-              elos = [str(team['elo_rating']) for team in teams]
+            leaderboard_lines = [f"{index}. **{team['team_name']}** (ELO: **{team['elo_rating']}**) - **{await get_common_name(team['player1_id'])} & {await get_common_name(team['player2_id'])}**" for index, team in enumerate(teams, 1)]
+            embed.add_field(name="Top Teams", value="\n".join(leaderboard_lines))
 
-              # Fetch player common names using separate queries
-              player_names = []
-              async def get_common_name(player_id):
-                  player = await conn.fetchval("""
-                      SELECT common_name FROM ranked_players WHERE id = $1;
-                  """, player_id)
-                  return player if player else "Unknown Name"  # Set a default value for missing names
+        await interaction.followup.send(embed=embed)
 
-              for team in teams:
-                  player1_name = await get_common_name(team['player1_id'])
-                  player2_name = await get_common_name(team['player2_id'])
-                  player_names.append(f"{player1_name} & {player2_name}")
-
-              combined_info = [f"{rank_tier[i]} **{team_names[i]}** (ELO: **{elos[i]}**) - **{player_names[i]}**" for i in range(len(rank_tier))]
-              embed.add_field(name="Top Teams", value="\n".join(combined_info))
-
-
-
-              await interaction.followup.send(embed=embed)
     finally:
         await close_db_connection(conn)
-        
 
 async def update_leaderboard_message():
     conn = await create_db_connection()
@@ -669,6 +658,7 @@ async def update_leaderboard_message():
 
     finally:
         await close_db_connection(conn)
+
 
 ####################################
 #ELO Duel related code
@@ -759,21 +749,28 @@ def calculate_elo(R, K, games_won, games_played, opponent_rating, c=400):
 #async def update_leaderboard_message():
     # Function to update the leaderboard message
     # Implementation of this function depends on how the leaderboard message is managed in your bot
-
+    
+    
+# Define the slash command decorator
 @bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a duel between two players.")
 async def submit_duel(interaction: discord.Interaction, submitter_score: int, opponent: discord.Member, opponent_score: int):
+    # Defer the initial response
     await interaction.response.defer()
     duel_message = None
     try:
+        # Check if the user is trying to duel themselves
         if interaction.user.id == opponent.id:
             await interaction.followup.send("You cannot duel yourself!", ephemeral=True)
             return
 
+        # Create a database connection
         conn = await create_db_connection()
 
+        # Fetch information about retired players, if any
         records = await conn.fetch("SELECT discordid, retired FROM ranked_players WHERE discordid = ANY($1::bigint[])", [interaction.user.id, opponent.id])
         retired_players = {record['discordid']: record['retired'] for record in records if record['retired']}
 
+        # Check if any players are retired
         if retired_players:
             message = ""
             for discord_id, retired in retired_players.items():
@@ -783,31 +780,40 @@ async def submit_duel(interaction: discord.Interaction, submitter_score: int, op
             await interaction.followup.send(message, ephemeral=True)
             return
 
+        # Determine the submitter and opponent Discord IDs
         submitter_discordid = interaction.user.id
         opponent_discordid = opponent.id
 
+        # Determine the winner and loser
         winner, loser = (interaction.user, opponent) if submitter_score > opponent_score else (opponent, interaction.user)
         winner_score, loser_score = max(submitter_score, opponent_score), min(submitter_score, opponent_score)
         winner_label = " (winner)" if winner != interaction.user else " (winner, submitter)"
         submitter_label = " (submitter)" if interaction.user == winner else ""
 
+        # Create the command text
         command_text = f"/submit_duel @{interaction.user.display_name} {submitter_score} @{opponent.display_name} {opponent_score}"
 
+        # Define the target guild ID and audit channel ID
         target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
         audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and audit channel
         target_guild = bot.get_guild(target_guild_id)
         audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
 
+        # Send an audit message if the audit channel exists
         if audit_channel:
-            audit_message = f"Command executed: `/submit_duel {submitter_score} @{opponent.display_name} {opponent_score}` by {interaction.user.display_name} ({interaction.user.id})"
+            audit_message = f"Command executed: `{command_text}` by {interaction.user.display_name} ({interaction.user.id})"
             await audit_channel.send(audit_message)
 
+        # Create and send the initial embed for the duel result
         embed = discord.Embed(title="Duel Result (UNVERIFIED)", description=f"Command: `{command_text}`", color=discord.Color.orange())
         embed.add_field(name="Matchup", value=f"{winner.display_name}{winner_label} vs {loser.display_name}{submitter_label}", inline=False)
         embed.add_field(name="Score", value=f"{winner_score}-{loser_score}", inline=True)
 
         duel_message = await interaction.followup.send(embed=embed)
 
+        # Insert the duel confirmation into the database
         try:
             await conn.execute("""
                 INSERT INTO duel_confirmations (message_id, channel_id, submitter_id, opponent_id, winner_id, loser_id, submitter_score, opponent_score, winner_score, loser_score, status) 
@@ -816,20 +822,30 @@ async def submit_duel(interaction: discord.Interaction, submitter_score: int, op
         finally:
             await conn.close()
 
+        # Calculate the expiration time for the duel confirmation
         cst_timezone = pytz.timezone('America/Chicago')
         current_time_cst = datetime.now(pytz.utc).astimezone(cst_timezone)
         expiration_time_cst = current_time_cst + timedelta(minutes=60)
         expiration_unix_timestamp = int(expiration_time_cst.timestamp())
 
+        # Send the verification request
         verification_request = f"This result will automatically expire <t:{expiration_unix_timestamp}:R>.\n"
         verification_request += f"{opponent.mention} please react to this message confirming or denying the match results."
         embed.description += f"\n\n{verification_request}"
 
         verification_message = await interaction.followup.send(f"{opponent.mention} please react to the above message confirming or denying the match results.")
-        view = ConfirmationView(interaction.user.id, opponent.id, duel_message, winner.id, loser.id, winner_score, loser_score, verification_message=verification_message)
+
+        # Create the ConfirmationView instance
+        view = ConfirmationView(
+            interaction.user.id, opponent.id, duel_message, winner.id, loser.id, winner_score, loser_score,
+            target_guild_id=target_guild_id, audit_channel_id=audit_channel_id, verification_message=verification_message
+        )
+
+        # Edit the duel message with the ConfirmationView
         await duel_message.edit(view=view)
 
     except Exception as e:
+        # Handle exceptions
         error_message = f"An unexpected error occurred: {e}"
         print(error_message)
         traceback.print_exc()
@@ -841,9 +857,9 @@ async def submit_duel(interaction: discord.Interaction, submitter_score: int, op
             ))
         await interaction.followup.send("An error occurred while processing the duel.", ephemeral=True)
 
-
+# Define the ConfirmationView class
 class ConfirmationView(discord.ui.View):
-    def __init__(self, submitter_id, non_submitter_id, duel_message, winner_id, loser_id, winner_score, loser_score, verification_message=None, *args, **kwargs):
+    def __init__(self, submitter_id, non_submitter_id, duel_message, winner_id, loser_id, winner_score, loser_score, target_guild_id, audit_channel_id, verification_message=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.submitter_id = submitter_id
         self.non_submitter_id = non_submitter_id
@@ -853,10 +869,18 @@ class ConfirmationView(discord.ui.View):
         self.loser_id = loser_id
         self.winner_score = winner_score
         self.loser_score = loser_score
+        self.target_guild_id = target_guild_id
+        self.audit_channel_id = audit_channel_id
         self.verification_message = verification_message
         self.duel_message_id = duel_message.id
         self.channel_id = duel_message.channel.id
 
+    async def clear_buttons(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                self.remove_item(item)
+
+        # Create the confirm and deny buttons
         self.confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.green, custom_id=f"confirm_{duel_message.id}")
         self.confirm_button.callback = self.confirm_button_clicked
 
@@ -866,11 +890,10 @@ class ConfirmationView(discord.ui.View):
         self.add_item(self.confirm_button)
         self.add_item(self.deny_button)
 
-        # Keep track of button click state
         self.confirm_clicked = False
         self.deny_clicked = False
 
-        # Disable buttons for the submitter who submitted the results
+        # Disable buttons for the submitter
         if self.submitter_id == duel_message.author.id:
             self.confirm_button.disabled = True
             self.deny_button.disabled = True
@@ -878,7 +901,7 @@ class ConfirmationView(discord.ui.View):
     async def confirm_button_clicked(self, interaction: discord.Interaction):
         if interaction.user.id == self.non_submitter_id and not self.confirm_clicked:
             self.confirm_clicked = True
-            await self.handle_confirm(interaction, self.winner_score, self.loser_score)
+            await self.handle_confirm(interaction)
         else:
             await interaction.response.send_message("Only the challenged player can confirm this duel or you have already confirmed.", ephemeral=True)
 
@@ -905,24 +928,13 @@ class ConfirmationView(discord.ui.View):
         if self.verification_message:
             await self.verification_message.delete()
         await interaction.response.send_message("Duel cancelled.", ephemeral=True)
-        
-        def clear_buttons(self):
-        # Clear all buttons from the view
-            self.children.clear()  # This will remove all UI elements from the view
-            # Update the message to show the view without buttons
-            return self.duel_message.edit(view=self)
 
-async def handle_confirm(self, interaction: discord.Interaction):
+async def handle_confirm(self, interaction: discord.Interaction, conn):
     try:
         await interaction.response.defer()
-        await self.clear_buttons()
-        conn = await create_db_connection()
-
-        target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
-        audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
-
-        target_guild = bot.get_guild(target_guild_id)
-        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+        
+        target_guild = bot.get_guild(self.target_guild_id)
+        audit_channel = target_guild.get_channel(self.audit_channel_id) if target_guild else None
 
         winner_data = await conn.fetchrow("SELECT discordid, elo_duelsx FROM ranked_players WHERE discordid = $1", self.winner_id)
         loser_data = await conn.fetchrow("SELECT discordid, elo_duelsx FROM ranked_players WHERE discordid = $1", self.loser_id)
@@ -930,7 +942,7 @@ async def handle_confirm(self, interaction: discord.Interaction):
         if winner_data and loser_data:
             winner_discordid, winner_rating = winner_data
             loser_discordid, loser_rating = loser_data
-            await self.clear_buttons()
+            
             new_winner_elo_exact = calculate_elo(winner_rating, 32, 1, 1, loser_rating)
             new_loser_elo_exact = calculate_elo(loser_rating, 32, 0, 1, winner_rating)
 
@@ -958,73 +970,130 @@ async def handle_confirm(self, interaction: discord.Interaction):
                 payout_amount = round(house_balance * payout_rate_percentage)
                 if house_balance >= payout_amount * 2:
                     new_house_balance = house_balance - (payout_amount * 2)
-                    await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE discordid = ANY($2::bigint[])", payout_amount, [self.winner_id, self.loser_id])
-                    await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
+                    await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE discordid = ANY($2::bigint[])", payout_amount, [winner_discordid, loser_discordid])
 
-            updated_winner_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", self.winner_id)
-            updated_loser_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", self.loser_id)
+            await conn.execute("INSERT INTO house_account (balance, payout_rate, payout_amount) VALUES ($1, $2, $3)", new_house_balance, payout_rate_percentage, payout_amount)
 
-            updated_winner_elo, updated_winner_purse = updated_winner_data['elo_duelsx'], updated_winner_data['coins']
-            updated_loser_elo, updated_loser_purse = updated_loser_data['elo_duelsx'], updated_loser_data['coins']
-            tier_assignments = await calculate_tiers(conn)
-            winner_tier_emoji = tier_assignments.get(winner_discordid, ':regional_indicator_d:')
-            loser_tier_emoji = tier_assignments.get(loser_discordid, ':regional_indicator_d:')
-
-            updated_embed = discord.Embed(
-                title=f"1v1 Duel Winner: {interaction.guild.get_member(self.winner_id).display_name} vs {interaction.guild.get_member(self.loser_id).display_name} ({self.winner_score}-{self.loser_score})",
+            await interaction.followup.send(f"Duel confirmed. {interaction.guild.get_member(self.winner_id).display_name} gained {winner_elo_change_formatted} ELO ({new_winner_elo_exact} -> {new_winner_elo_exact + winner_elo_change}), {interaction.guild.get_member(self.loser_id).display_name} gained {loser_elo_change_formatted} ELO ({new_loser_elo_exact} -> {new_loser_elo_exact + loser_elo_change}).", ephemeral=True)
+            await audit_channel.send(embed=discord.Embed(
+                title="Duel Confirmed",
+                description=f"Duel between {interaction.guild.get_member(self.winner_id).display_name} and {interaction.guild.get_member(self.loser_id).display_name} has been confirmed by {interaction.user.display_name}.",
                 color=discord.Color.green()
-            )
-            updated_embed.add_field(name=f"{interaction.guild.get_member(self.winner_id).display_name}: {round(updated_winner_elo)} ({winner_elo_change_formatted})", value=f"{winner_tier_emoji}   :coin: {updated_winner_purse}", inline=True)
-            updated_embed.add_field(name=f"{interaction.guild.get_member(self.loser_id).display_name}: {round(updated_loser_elo)} ({loser_elo_change_formatted})", value=f"{loser_tier_emoji}   :coin: {updated_loser_purse}", inline=True)
-            updated_embed.set_footer(text=f"Match result confirmed by {interaction.user.display_name}")
-            updated_embed.timestamp = datetime.now()
-
-            total_reward = coin_reward + payout_amount
-
-            description_lines = [
-                f"`/submit_duel {self.winner_score} @{interaction.guild.get_member(self.non_submitter_id).display_name} {self.loser_score}`",
-                f"Payout: **{total_reward}** [ {coin_reward} + ({payout_amount} house tip) ]",
-                f"Purse: 0"  # Placeholder, replace with actual purse logic if necessary
-            ]
-            updated_embed.description = "\n".join(description_lines)
-
-            #updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
-
-            await self.duel_message.edit(embed=updated_embed)
-
-            # Call echo_to_guilds function to send the message to other guilds
-            audit_message = await echo_to_guilds(interaction, updated_embed, 'chivstats-ranked')
-
-            # Send audit message to the audit channel
-            if audit_channel:
-                await audit_channel.send(audit_message)
-
-            winner_rank = await get_player_rank(conn, updated_winner_elo)
-            loser_rank = await get_player_rank(conn, updated_loser_elo)
-
-            # Modify the confirmation message to include ranks instead of tier emojis
-            confirmation_message = (
-                f"**Duel**: [{self.winner_score}-{self.loser_score}] **{interaction.guild.get_member(self.winner_id).display_name}** _({round(updated_winner_elo)})_ "
-                f"vs. **{interaction.guild.get_member(self.loser_id).display_name}** _({round(updated_loser_elo)})_ [elo:{winner_elo_change}, coin:{total_reward}]."
-            )
-            for guild in bot.guilds:
-                ranked_audit_channel = discord.utils.get(guild.text_channels, name='ranked-audit')
-                if ranked_audit_channel:
-                    await ranked_audit_channel.send(confirmation_message)
-
-            if self.verification_message:
-                await self.verification_message.delete()
-
-            await self.clear_buttons()
-            await self.duel_message.edit(view=self)
-            await update_leaderboard_message()
-
-            if interaction.response.is_done():
-                await interaction.followup.send("Duel confirmed.", ephemeral=True)
+            ))
         else:
-            await interaction.response.send_message("One or both players are not registered in the ranking system.", ephemeral=True)
-        await conn.close()
+            await interaction.followup.send("Error: Could not find winner or loser data.", ephemeral=True)
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
+        error_message = f"An unexpected error occurred: {e}"
+        print(error_message)
+        traceback.print_exc()
+        await interaction.followup.send("An error occurred while confirming the duel.", ephemeral=True)
+    finally:
+        await conn.close()
+
+async def confirm_button_clicked(self, interaction: discord.Interaction, conn):
+    if interaction.user.id == self.non_submitter_id and not self.confirm_clicked:
+        self.confirm_clicked = True
+        await self.handle_confirm(interaction, conn)
+    else:
+        await interaction.response.send_message("Only the challenged player can confirm this duel or you have already confirmed.", ephemeral=True)
+
+# Define the slash command decorator
+@bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a duel between two players.")
+async def submit_duel(interaction: discord.Interaction, submitter_score: int, opponent: discord.Member, opponent_score: int):
+    # Defer the initial response
+    await interaction.response.defer()
+    duel_message = None
+    try:
+        # Check if the user is trying to duel themselves
+        if interaction.user.id == opponent.id:
+            await interaction.followup.send("You cannot duel yourself!", ephemeral=True)
+            return
+
+        # Create a database connection
+        conn = await create_db_connection()
+
+        # Fetch information about retired players, if any
+        records = await conn.fetch("SELECT discordid, retired FROM ranked_players WHERE discordid = ANY($1::bigint[])", [interaction.user.id, opponent.id])
+        retired_players = {record['discordid']: record['retired'] for record in records if record['retired']}
+
+        # Check if any players are retired
+        if retired_players:
+            message = ""
+            for discord_id, retired in retired_players.items():
+                if retired:
+                    mention = f"<@{discord_id}>"
+                    message += f"{mention} has retired. Please reactivate your account using /reactivate.\n" if discord_id == interaction.user.id else f"Please ask {mention} to reactivate.\n"
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        # Determine the submitter and opponent Discord IDs
+        submitter_discordid = interaction.user.id
+        opponent_discordid = opponent.id
+
+        # Determine the winner and loser
+        winner, loser = (interaction.user, opponent) if submitter_score > opponent_score else (opponent, interaction.user)
+        winner_score, loser_score = max(submitter_score, opponent_score), min(submitter_score, opponent_score)
+        winner_label = " (winner)" if winner != interaction.user else " (winner, submitter)"
+        submitter_label = " (submitter)" if interaction.user == winner else ""
+
+        # Create the command text
+        command_text = f"/submit_duel @{interaction.user.display_name} {submitter_score} @{opponent.display_name} {opponent_score}"
+
+        # Define the target guild ID and audit channel ID
+        target_guild_id = 1227017798916505780  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1227018572937564170  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and audit channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        # Send an audit message if the audit channel exists
+        if audit_channel:
+            audit_message = f"Command executed: `{command_text}` by {interaction.user.display_name} ({interaction.user.id})"
+            await audit_channel.send(audit_message)
+
+        # Create and send the initial embed for the duel result
+        embed = discord.Embed(title="Duel Result (UNVERIFIED)", description=f"Command: `{command_text}`", color=discord.Color.orange())
+        embed.add_field(name="Matchup", value=f"{winner.display_name}{winner_label} vs {loser.display_name}{submitter_label}", inline=False)
+        embed.add_field(name="Score", value=f"{winner_score}-{loser_score}", inline=True)
+
+        duel_message = await interaction.followup.send(embed=embed)
+
+        # Insert the duel confirmation into the database
+        try:
+            await conn.execute("""
+                INSERT INTO duel_confirmations (message_id, channel_id, submitter_id, opponent_id, winner_id, loser_id, submitter_score, opponent_score, winner_score, loser_score, status) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+            """, duel_message.id, duel_message.channel.id, interaction.user.id, opponent.id, winner.id, loser.id, submitter_score, opponent_score, winner_score, loser_score)
+        finally:
+            await conn.close()
+
+        # Calculate the expiration time for the duel confirmation
+        cst_timezone = pytz.timezone('America/Chicago')
+        current_time_cst = datetime.now(pytz.utc).astimezone(cst_timezone)
+        expiration_time_cst = current_time_cst + timedelta(minutes=60)
+        expiration_unix_timestamp = int(expiration_time_cst.timestamp())
+
+        # Send the verification request
+        verification_request = f"This result will automatically expire <t:{expiration_unix_timestamp}:R>.\n"
+        verification_request += f"{opponent.mention} please react to this message confirming or denying the match results."
+        embed.description += f"\n\n{verification_request}"
+
+        verification_message = await interaction.followup.send(f"{opponent.mention} please react to the above message confirming or denying the match results.")
+
+        # Create the ConfirmationView instance
+        view = ConfirmationView(
+            interaction.user.id, opponent.id, duel_message, winner.id, loser.id, winner_score, loser_score,
+            target_guild_id=target_guild_id, audit_channel_id=audit_channel_id, verification_message=verification_message
+        )
+
+        # Edit the duel message with the ConfirmationView
+        await duel_message.edit(view=view)
+
+    except Exception as e:
+        # Handle exceptions
         error_message = f"An unexpected error occurred: {e}"
         print(error_message)
         traceback.print_exc()
@@ -1036,8 +1105,7 @@ async def handle_confirm(self, interaction: discord.Interaction):
             ))
         await interaction.followup.send("An error occurred while processing the duel.", ephemeral=True)
 
-
-
+            
 
 ##############
 # END DUELS
